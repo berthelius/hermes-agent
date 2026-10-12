@@ -649,6 +649,110 @@ def test_respawn_guard_ignores_stale_rate_limit_stamp_after_changes_requested(
         assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
 
 
+def test_respawn_guard_ignores_stale_rate_limit_stamp_after_manual_reclaim(
+    kanban_home, monkeypatch,
+):
+    """A manual ``hermes kanban reclaim`` / ``reassign --reclaim`` writes
+    ``outcome="reclaimed"`` via ``_record_reclaim`` (``error`` lands on
+    ``task_runs.error``, not ``tasks.last_failure_error``), but a PRIOR
+    ``rate_limited`` requeue already stamped ``tasks.last_failure_error``
+    with a quota-flavored diagnostic. The guard must skip the regex
+    whenever the latest run is a manual operator action that did not
+    write the stamp itself — the stamp is from an earlier diagnosis the
+    operator chose to override (#t_b5bb637e, case t_2125a6d8 where the
+    card was reclaimed and then blocked 30+ times with blocker_auth
+    before the operator gave up).
+
+    Same shape as the ``changes_requested``/``review_requested``/
+    ``completed`` carve-out added in #t_613980e8: ``reclaimed`` is one
+    more outcome that neither writes ``last_failure_error`` nor
+    inherits it as a fresh diagnostic, so a stamp from a previous run
+    cannot be re-interpreted as a blocker on a later operator-decided
+    outcome.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    now = 5_000_000
+
+    def _seed(card_title: str, *, last_failure_error: str) -> str:
+        with kbc.connect() as conn:
+            tid = kb.create_task(conn, title=card_title, assignee="a")
+            # Earlier rate-limited requeue stamped the quota text — same shape
+            # the real requeue path writes (kanban_db_dispatch._classify_dead_worker
+            # at "pid N exited rate-limited (quota wall)").
+            conn.execute(
+                "UPDATE tasks SET last_failure_error=? WHERE id=?",
+                (last_failure_error, tid),
+            )
+            # The manual reclaim path: _record_reclaim -> _end_run with
+            # outcome="reclaimed", error="manual_reclaim lock=...". _record_reclaim
+            # writes the error to ``task_runs.error`` (not ``tasks.last_failure_error``);
+            # ``reclaim_task`` then calls ``_clear_failure_counter`` to wipe the
+            # task's failure counter — but in the bug case the operator reclaims
+            # WHILE the stamp is still present (the reclaim's write_txn commits
+            # the stamp's presence from before; the clear runs after). Even when
+            # the clear succeeds, the latest run's outcome is "reclaimed" — and
+            # a subsequent re-stamp by a fresh rate-limit or crash supersedes
+            # only the run, not the carve-out invariant the guard must respect.
+            kb.claim_task(conn, tid)
+            run_id = kb.get_task(conn, tid).current_run_id
+            conn.execute(
+                "UPDATE task_runs SET outcome='reclaimed', status='ready', "
+                "error='manual_reclaim lock=foo', ended_at=? WHERE id=?",
+                (now, run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='ready', current_run_id=NULL, "
+                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+                "WHERE id=?",
+                (tid,),
+            )
+            conn.commit()
+        return tid
+
+    # Primary bug case: quota stamp + manual reclaim. Without the fix, the
+    # regex matches "quota" and the card sits parked in `ready` forever.
+    quota_id = _seed(
+        "stale stamp + manual reclaim",
+        last_failure_error="pid 1 exited rate-limited (quota wall) — requeued",
+    )
+    with kbc.connect() as conn:
+        assert kbd.check_respawn_guard(conn, quota_id) is None
+
+    # Same shape with a different stamp flavor (auth/rate/etc.) — the guard
+    # must skip the regex for ANY stale stamp once the latest run is "reclaimed".
+    auth_id = _seed(
+        "stale auth stamp + manual reclaim",
+        last_failure_error="provider authentication failed during spawn",
+    )
+    with kbc.connect() as conn:
+        assert kbd.check_respawn_guard(conn, auth_id) is None
+
+    # Negative control: an actual ``spawn_failed`` (which DOES write the
+    # stamp itself via _record_task_failure) must still trip the guard —
+    # the carve-out is for non-failure outcomes only, and a "reclaimed"
+    # run is paired with a stamp from a *different* run, while "spawn_failed"
+    # here is paired with a stamp the run itself authored.
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="real blocker, not reclaimed", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='spawn_failed', status='failed', "
+            "ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("provider authentication failed during spawn", tid),
+        )
+        conn.commit()
+        assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
+
+
 def test_infrastructure_spawn_refusal_never_charges_the_card(
     kanban_home, monkeypatch, all_assignees_spawnable,
 ):

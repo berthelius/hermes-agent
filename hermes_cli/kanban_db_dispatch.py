@@ -1600,6 +1600,14 @@ def check_respawn_guard(
     #          match.
     _NON_FAILURE_OUTCOMES = frozenset({
         "completed", "review_requested", "changes_requested", "crashed",
+        # A manual ``hermes kanban reclaim`` / ``reassign --reclaim`` writes
+        # ``outcome="reclaimed"`` via ``_record_reclaim`` (the error lands on
+        # ``task_runs.error``, not ``tasks.last_failure_error``) — the operator
+        # has deliberately released the run. A stamp from an EARLIER
+        # rate-limit requeue or spawn-failure is stale and must not re-trap
+        # the card (#t_b5bb637e, case t_2125a6d8: 30+ consecutive
+        # ``respawn_guarded blocker_auth`` after a manual reclaim).
+        "reclaimed",
     })
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
