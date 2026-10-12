@@ -1582,13 +1582,28 @@ def check_respawn_guard(
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.  A plain
-    # crash is different: its persisted error includes the worker's last
-    # captured output, which is context rather than a diagnosis and may contain
-    # benign commands such as ``claude auth status`` (#117097).
+    # 2. Quota / auth blocker: retrying immediately will not help.  Two reasons
+    #    a non-failure latest outcome must skip this regex check:
+    #      (a) a plain ``crashed`` run's persisted error includes the worker's
+    #          last captured output, which is context rather than a diagnosis
+    #          and may contain benign commands such as ``claude auth status``
+    #          (#117097);
+    #      (b) a run that ended in ``completed`` / ``review_requested`` /
+    #          ``changes_requested`` does NOT write ``last_failure_error`` at
+    #          all — but a rate-limit requeue that ran earlier DOES stamp it
+    #          with a quota-flavored diagnostic. When a later run supersedes
+    #          that requeue with a non-failure outcome, the stamp is stale:
+    #          matching it here parked a healthy ``ready`` card forever
+    #          (#t_613980e8, case t_d027343f). The carve-out is the set of
+    #          outcomes that neither stamp ``last_failure_error`` nor inherit
+    #          it as a fresh diagnostic — anything else may legitimately
+    #          match.
+    _NON_FAILURE_OUTCOMES = frozenset({
+        "completed", "review_requested", "changes_requested", "crashed",
+    })
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    if err and latest_outcome not in _NON_FAILURE_OUTCOMES and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
